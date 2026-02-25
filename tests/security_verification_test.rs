@@ -231,3 +231,190 @@ mod integration_security_tests {
         assert!(cos > 0.99 && cos <= 1.0);
     }
 }
+
+/// RV-2025-001 through RV-2025-005: Security audit vulnerability verification tests
+/// These tests verify security-relevant behaviors identified in the 2025 audit.
+#[cfg(test)]
+mod audit_2025_tests {
+
+    /// RV-2025-001: Verify that path traversal patterns are detectable.
+    /// The MCP backup handler passes user-supplied paths directly to std::fs::copy().
+    /// This test demonstrates the vulnerability pattern.
+    #[test]
+    fn test_path_traversal_pattern_detection() {
+        let malicious_paths = [
+            "../../../etc/passwd",
+            "/etc/shadow",
+            "../../.ssh/id_rsa",
+            "/dev/zero",
+            "..\\..\\windows\\system32\\config\\sam",
+        ];
+
+        for path in &malicious_paths {
+            let path_buf = std::path::PathBuf::from(path);
+            // Verify that path contains traversal components
+            let has_traversal = path_buf.components().any(|c| {
+                matches!(c, std::path::Component::ParentDir)
+            });
+            let is_absolute = path_buf.is_absolute();
+
+            // Any path with parent dir traversal or absolute paths to sensitive
+            // locations should be rejected by a proper validator
+            assert!(
+                has_traversal || is_absolute,
+                "Path '{}' should be detected as potentially dangerous",
+                path
+            );
+        }
+    }
+
+    /// RV-2025-001: Verify that a proper path validator rejects traversal attempts.
+    #[test]
+    fn test_path_validation_logic() {
+        use std::path::{Path, PathBuf};
+
+        fn validate_path(path: &str, allowed_base: &Path) -> Result<PathBuf, String> {
+            let path = PathBuf::from(path);
+            // Reject obvious traversal attempts
+            for component in path.components() {
+                if matches!(component, std::path::Component::ParentDir) {
+                    return Err("Path traversal detected".to_string());
+                }
+            }
+            // Reject absolute paths
+            if path.is_absolute() {
+                return Err("Absolute paths not allowed".to_string());
+            }
+            let resolved = allowed_base.join(&path);
+            if !resolved.starts_with(allowed_base) {
+                return Err("Path outside allowed directory".to_string());
+            }
+            Ok(resolved)
+        }
+
+        let base = Path::new("/tmp/ruvector-data");
+
+        // These should be rejected
+        assert!(validate_path("../../../etc/passwd", base).is_err());
+        assert!(validate_path("/etc/shadow", base).is_err());
+        assert!(validate_path("../../.ssh/id_rsa", base).is_err());
+
+        // These should be accepted
+        assert!(validate_path("mydb.db", base).is_ok());
+        assert!(validate_path("backups/mydb.bak", base).is_ok());
+    }
+
+    /// RV-2025-002: Document CORS misconfiguration vulnerability.
+    /// The server at crates/ruvector-server/src/lib.rs lines 84-89 uses:
+    ///   CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any)
+    /// This allows any website to make cross-origin requests to the API.
+    #[test]
+    fn test_cors_vulnerability_documented() {
+        // Verify the vulnerable code pattern exists in the source file
+        let server_lib = include_str!("../crates/ruvector-server/src/lib.rs");
+        assert!(
+            server_lib.contains("allow_origin(Any)"),
+            "CORS should use Any origin (vulnerability RV-2025-002)"
+        );
+        assert!(
+            server_lib.contains("allow_methods(Any)"),
+            "CORS should use Any methods (vulnerability RV-2025-002)"
+        );
+        assert!(
+            server_lib.contains("allow_headers(Any)"),
+            "CORS should use Any headers (vulnerability RV-2025-002)"
+        );
+    }
+
+    /// RV-2025-003: Verify that SearchRequest k parameter has no upper bound.
+    /// The SearchRequest in crates/ruvector-server/src/routes/points.rs accepts any
+    /// usize for k with only a default of 10.
+    #[test]
+    fn test_unbounded_k_parameter() {
+        let server_points = include_str!("../crates/ruvector-server/src/routes/points.rs");
+        // Verify there is no MAX_K constant or k validation
+        assert!(
+            !server_points.contains("MAX_K") && !server_points.contains("max_k"),
+            "There should be no k upper bound (vulnerability RV-2025-003)"
+        );
+        // Verify the k field type is usize (no wrapper type with validation)
+        assert!(
+            server_points.contains("pub k: usize"),
+            "k should be raw usize with no validation wrapper"
+        );
+    }
+
+    /// RV-2025-003: Verify that batch insert has no size limit.
+    #[test]
+    fn test_unbounded_batch_size() {
+        let server_points = include_str!("../crates/ruvector-server/src/routes/points.rs");
+        // Verify there is no batch size limit
+        assert!(
+            !server_points.contains("MAX_BATCH") && !server_points.contains("max_batch"),
+            "There should be no batch size limit (vulnerability RV-2025-003)"
+        );
+        // Verify no DefaultBodyLimit is configured
+        let server_lib = include_str!("../crates/ruvector-server/src/lib.rs");
+        assert!(
+            !server_lib.contains("DefaultBodyLimit"),
+            "There should be no body size limit (vulnerability RV-2025-003)"
+        );
+    }
+
+    /// RV-2025-005: Verify that error responses contain internal details.
+    /// The Error impl in crates/ruvector-server/src/error.rs exposes internal
+    /// error messages directly to clients via e.to_string().
+    #[test]
+    fn test_error_message_contains_details() {
+        let server_error = include_str!("../crates/ruvector-server/src/error.rs");
+        // Verify that internal errors are exposed to clients
+        // The Core error variant passes the full error message via e.to_string()
+        assert!(
+            server_error.contains("e.to_string()"),
+            "Internal error details should be exposed (vulnerability RV-2025-005)"
+        );
+        // Verify no generic error message replacement for internal errors
+        assert!(
+            !server_error.contains("Internal server error"),
+            "There should be no generic error message replacement"
+        );
+
+        // Also verify MCP handler leaks errors
+        let mcp_handlers = include_str!("../crates/ruvector-cli/src/mcp/handlers.rs");
+        assert!(
+            mcp_handlers.contains("e.to_string()"),
+            "MCP handler should expose internal errors (vulnerability RV-2025-005)"
+        );
+    }
+
+    /// RV-2025-001: Verify that MCP backup handler has no path validation.
+    #[test]
+    fn test_backup_handler_no_path_validation() {
+        let mcp_handlers = include_str!("../crates/ruvector-cli/src/mcp/handlers.rs");
+        // Verify std::fs::copy is used with user-supplied paths
+        assert!(
+            mcp_handlers.contains("std::fs::copy(&params.db_path, &params.backup_path)"),
+            "Backup handler should use unsanitized paths (vulnerability RV-2025-001)"
+        );
+        // Verify no canonicalize() call exists
+        assert!(
+            !mcp_handlers.contains("canonicalize"),
+            "There should be no path canonicalization"
+        );
+    }
+
+    /// RV-2025-004: Verify that no authentication middleware exists.
+    #[test]
+    fn test_no_authentication_middleware() {
+        let server_lib = include_str!("../crates/ruvector-server/src/lib.rs");
+        // Verify no authentication middleware
+        assert!(
+            !server_lib.contains("auth") && !server_lib.contains("Auth"),
+            "There should be no authentication middleware (vulnerability RV-2025-004)"
+        );
+        assert!(
+            !server_lib.contains("Bearer") && !server_lib.contains("API_KEY"),
+            "There should be no API key validation"
+        );
+    }
+}
